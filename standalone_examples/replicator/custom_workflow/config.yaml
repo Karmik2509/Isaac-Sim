@@ -1,0 +1,23 @@
+# Custom warehouse RGB + bounding-box SDG configuration.
+launch_config:
+  renderer: RealTimePathTracing
+  headless: true
+
+resolution: [512, 512]
+rt_subframes: 32
+num_frames: 10
+
+env_url: "/home/i2v/Downloads/Industrial_NVD@10012/Assets/ArchVis/Industrial/Stages/IsaacWarehouse.usd"
+target_prim_name: "RackLargeEmpty_A1"
+target_class: "RackLargeEmpty_A1"
+
+writer: BasicWriter
+backend_type: DiskBackend
+backend_params:
+  output_dir: "_out_custom_workflow"
+writer_config:
+  rgb: true
+  bounding_box_2d_tight: true
+  bounding_box_3d: true
+
+close_app_after_run: true
