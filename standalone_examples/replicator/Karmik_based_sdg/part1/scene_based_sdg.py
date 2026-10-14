@@ -1,0 +1,283 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Generate offline synthetic dataset."""
+
+import argparse
+import json
+import math
+import os
+
+import numpy as np
+import yaml
+from isaacsim import SimulationApp
+
+# Default configuration
+config = {
+    "launch_config": {
+        "renderer": "RealTimePathTracing",
+        "headless": False,
+    },
+    "resolution": [1920, 1080],
+    "rt_subframes": 32,
+    "num_frames": 50,
+    "env_url": "/Isaac/Environments/Simple_Warehouse/full_warehouse.usd",
+    "writer": "BasicWriter",
+    "backend_type": "DiskBackend",
+    "backend_params": {
+        "output_dir": "_out_scene_based_sdg",
+    },
+    "writer_config": {
+        "rgb": True,
+        "bounding_box_2d_tight": True,
+        "semantic_segmentation": True,
+        "distance_to_image_plane": True,
+        "bounding_box_3d": True,
+        "occlusion": True,
+    },
+    "clear_previous_semantics": True,
+    "forklift": {
+        "url": "/Isaac/Props/Forklift/forklift.usd",
+        "class": "forklift",
+    },
+    "close_app_after_run": True,
+}
+
+CAMERA_POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_positions.json")
+
+import carb
+
+# Parse command line arguments for optional config file
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=False, help="Include specific config parameters (json or yaml))")
+args, unknown = parser.parse_known_args()
+
+# Load config file if provided
+args_config = {}
+if args.config and os.path.isfile(args.config):
+    print("File exist")
+    with open(args.config, "r") as f:
+        if args.config.endswith(".json"):
+            args_config = json.load(f)
+        elif args.config.endswith(".yaml"):
+            args_config = yaml.safe_load(f)
+        else:
+            carb.log_warn(f"File {args.config} is not json or yaml, will use default config")
+else:
+    carb.log_warn(f"File {args.config} does not exist, will use default config")
+
+# Clear default writer_config if overridden in args
+if "writer_config" in args_config:
+    config["writer_config"].clear()
+
+# Merge args config into default config
+config.update(args_config)
+
+# Initialize simulation app
+simulation_app = SimulationApp(launch_config=config["launch_config"])
+
+import carb.settings
+
+# Runtime modules (must import after SimulationApp creation)
+import omni.replicator.core as rep
+import omni.usd
+import scene_based_sdg_utils
+from isaacsim.core.experimental.prims import GeomPrim, RigidPrim, XformPrim
+from isaacsim.core.experimental.utils.semantics import add_labels, remove_all_labels
+from isaacsim.core.experimental.utils.stage import add_reference_to_stage, define_prim, get_current_stage, is_stage_loading, open_stage
+from isaacsim.core.experimental.utils.transform import euler_angles_to_quaternion
+from isaacsim.core.simulation_manager import SimulationManager
+from isaacsim.storage.native import get_assets_root_path
+from pxr import Gf
+
+def load_camera_positions() -> dict:
+    if os.path.exists(CAMERA_POSITIONS_FILE):
+        with open(CAMERA_POSITIONS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_camera_positions(positions: dict) -> None:
+    with open(CAMERA_POSITIONS_FILE, "w") as f:
+        json.dump(positions, f, indent=2)
+
+# Get assets root path from nucleus server
+assets_root_path = get_assets_root_path()
+if assets_root_path is None:
+    carb.log_error("Could not get nucleus server path, closing application..")
+    simulation_app.close()
+
+# Load environment stage
+print(f"[SDG] Loading Stage {config['env_url']}")
+stage_opened, _ = open_stage(assets_root_path + config["env_url"])
+if not stage_opened:
+    carb.log_error(f"Could not open stage{config['env_url']}, closing application..")
+    simulation_app.close()
+while is_stage_loading():
+    simulation_app.update()
+
+# Add dome light for ambient illumination
+rep.functional.create.dome_light(intensity=500.0)
+
+# Initialize randomization
+rep.set_global_seed(42)
+rng = np.random.default_rng(42)
+
+# Configure replicator for manual triggering
+rep.orchestrator.set_capture_on_play(False)
+
+# Set DLSS to Quality mode for best SDG results
+carb.settings.get_settings().set("rtx/post/dlss/execMode", 2)
+
+# Clear previous semantic labels
+if config["clear_previous_semantics"]:
+    for prim in get_current_stage().Traverse():
+        remove_all_labels(prim, include_descendants=True)
+
+# Create SDG scope for organizing all generated objects
+define_prim("/SDG", "Scope")
+
+# Spawn forklift at random pose
+forklift_path = "/SDG/Forklift"
+forklift_prim = define_prim(forklift_path)
+add_reference_to_stage(assets_root_path + config["forklift"]["url"], forklift_path)
+add_labels(forklift_prim, labels=[config["forklift"]["class"]], taxonomy="class")
+XformPrim(
+    forklift_path,
+    positions=(rng.uniform(-22, 3), rng.uniform(-5, 12), 0),
+    orientations=euler_angles_to_quaternion([0, 0, rng.uniform(0, math.pi)]).numpy(),
+    reset_xform_op_properties=True,
+)
+
+# Enable collision on forklift for overlap resolution
+geom = GeomPrim(f"{forklift_path}/.*", apply_collision_apis=True)
+geom.set_collision_approximations("convexHull")
+RigidPrim(forklift_path)
+
+SimulationManager.set_physics_dt(1.0 / 60.0)
+SimulationManager.initialize_physics()
+
+# Create cameras
+rep.functional.create.scope(name="Cameras", parent="/SDG")
+top_view_cam = rep.functional.create.camera(
+    focus_distance=400.0, focal_length=35.0, clipping_range=(0.1, 1000000.0), name="TopCam", parent="/SDG/Cameras"
+)
+
+camera_positions = load_camera_positions()
+
+left_cam = rep.functional.create.camera(
+    focus_distance=400.0, focal_length=24.0, clipping_range=(0.1, 10000000.0), name="LeftCamera", parent="/SDG/Cameras"
+)
+left_cam_pos = camera_positions.get("LeftCamera", {"position": [-4.5, 2.0, 2.5]})["position"]
+
+right_cam = rep.functional.create.camera(
+    focus_distance=400.0, focal_length=24.0, clipping_range=(0.1, 10000000.0), name="RightCam", parent="/SDG/Cameras"
+)
+right_cam_pos = camera_positions.get("RightCam", {"position": [4.5, 2.0, 2.5]})["position"]
+
+# Save default positions if file didn't exist
+if not camera_positions:
+    save_camera_positions({"LeftCamera": {"position": left_cam_pos}, "RightCam": {"position": right_cam_pos}})
+
+# Position top camera at a fixed overhead view
+rep.functional.modify.pose(
+    top_view_cam,
+    position_value=(-11, 1, 8),
+    look_at_value=forklift_prim,
+    look_at_up_axis=(0, 1, 0),
+)
+
+# Setup render products
+resolution = config.get("resolution", (512, 512))
+top_rp = rep.create.render_product(top_view_cam, resolution, name="TopView")
+left_rp = rep.create.render_product(left_cam, resolution, name="LeftView")
+right_rp = rep.create.render_product(right_cam, resolution, name="RightView")
+
+render_products = [top_rp, left_rp, right_rp]
+for render_product in render_products:
+    render_product.hydra_texture.set_updates_enabled(False)
+
+# Initialize writer and attach to render products
+writer = scene_based_sdg_utils.setup_writer(config)
+if not writer:
+    carb.log_error("[SDG] Failed to setup writer, closing application.")
+    simulation_app.close()
+
+writer.attach(render_products)
+
+for render_product in render_products:
+    render_product.hydra_texture.set_updates_enabled(True)
+
+# Configure raytracing subframes for material loading and motion artifacts
+rt_subframes = config.get("rt_subframes", -1)
+
+
+# Register graph-based randomizers for lights
+scene_based_sdg_utils.register_lights_graph_randomizer(forklift_prim, forklift_prim, event_name="randomize_lights")
+
+# SDG loop - generate frames with randomizations
+num_frames = config.get("num_frames", 0)
+print(f"[SDG] Running SDG for {num_frames} frames")
+for i in range(num_frames):
+    print(f"[SDG] Frame {i}/{num_frames}")
+
+    print(f"[SDG]  Randomizing forklift pose.")
+    forklift_pos = (rng.uniform(-22, 3), rng.uniform(-5, 12), 0)
+    forklift_rot_z = rng.uniform(0, math.pi)
+    quat_np = euler_angles_to_quaternion([0, 0, forklift_rot_z]).numpy()
+    forklift_prim.GetAttribute("xformOp:translate").Set(Gf.Vec3d(*forklift_pos))
+    forklift_prim.GetAttribute("xformOp:orient").Set(Gf.Quatd(quat_np[0], quat_np[1], quat_np[2], quat_np[3]))
+
+    print(f"[SDG]  Stepping physics to resolve overlaps.")
+    for _ in range(5):
+        SimulationManager.step()
+
+    print(f"[SDG]  Randomizing lights.")
+    rep.utils.send_og_event(event_name="randomize_lights")
+
+    print(f"[SDG]  Randomizing left camera.")
+    rep.functional.modify.pose(
+        left_cam,
+        position_value=left_cam_pos,
+        look_at_value=forklift_prim,
+        look_at_up_axis=(0, 0, 1),
+    )
+
+    print(f"[SDG]  Randomizing right camera.")
+    rep.functional.modify.pose(
+        right_cam,
+        position_value=right_cam_pos,
+        look_at_value=forklift_prim,
+        look_at_up_axis=(0, 0, 1),
+    )
+
+    print(f"[SDG]  Capturing frame with rt_subframes={rt_subframes}")
+    rep.orchestrator.step(delta_time=0.0, rt_subframes=rt_subframes)
+
+# Cleanup
+rep.orchestrator.wait_until_complete()
+writer.detach()
+for render_product in render_products:
+    render_product.destroy()
+
+# Check if the application should keep running after data generation
+close_app_after_run = config.get("close_app_after_run", True)
+if config["launch_config"]["headless"]:
+    if not close_app_after_run:
+        print("[SDG] 'close_app_after_run' is ignored when running headless. The application will be closed.")
+elif not close_app_after_run:
+    print("[SDG] The application will not be closed after the run. Make sure to close it manually.")
+    while simulation_app.is_running():
+        simulation_app.update()
+simulation_app.close()
